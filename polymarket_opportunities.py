@@ -31,11 +31,13 @@ dans watchlist.json / whale_wallets.json (voir generate_config_templates()).
 """
 
 import argparse
+import hashlib
 import json
 import logging
 import os
 import sys
 import time
+import xml.etree.ElementTree as ET
 from datetime import datetime, timezone
 
 import requests
@@ -86,6 +88,31 @@ NEW_MARKETS_SCAN_LIMIT = 100  # nb de marchés les plus récents examinés par t
 NEW_MARKETS_MIN_LIQUIDITY = 0  # filtre optionnel, en USD (0 = pas de filtre)
 SEEN_MARKETS_FILE = os.path.join(os.path.dirname(__file__), "seen_markets.json")
 
+# --- Pilier 2 : workflow d'actualité ---
+# Le vrai edge sur des marchés de niche vient souvent du DÉLAI entre une
+# actualité et sa prise en compte par le prix, pas d'un avis "meilleur".
+# Ces flux RSS gratuits (aucune clé requise) sont scannés à chaque passage ;
+# toute nouvelle actu détectée est alertée pour que tu vérifies si le marché
+# correspondant a déjà bougé ou non.
+NEWS_ENABLED = True
+NEWS_FEEDS = {
+    "Général": [
+        "https://news.google.com/rss/search?q=world%20news%20when:1h&hl=en-US&gl=US&ceid=US:en",
+    ],
+    "Moyen-Orient/Iran": [
+        "http://feeds.bbci.co.uk/news/world/middle_east/rss.xml",
+        "https://news.google.com/rss/search?q=Iran%20when:2h&hl=en-US&gl=US&ceid=US:en",
+    ],
+    "Elections US": [
+        "https://news.google.com/rss/search?q=Trump%20OR%20Congress%20when:2h&hl=en-US&gl=US&ceid=US:en",
+    ],
+    "Europe": [
+        "http://feeds.bbci.co.uk/news/world/europe/rss.xml",
+        "https://news.google.com/rss/search?q=Europe%20election%20when:2h&hl=en-US&gl=US&ceid=US:en",
+    ],
+}
+SEEN_NEWS_FILE = os.path.join(os.path.dirname(__file__), "seen_news.json")
+
 # --- Notifications téléphone (ntfy.sh) ---
 # Laisse vide pour désactiver. Sinon, choisis un nom de topic unique et
 # difficile à deviner (ex: "polymarket-adam-x7k2"), installe l'app ntfy sur
@@ -121,6 +148,20 @@ def _get(url, params=None, retries=3, timeout=10):
             log.warning("Échec requête (%s/%s) sur %s : %s", attempt, retries, url, exc)
             time.sleep(1.5 * attempt)
     log.error("Abandon après %s tentatives : %s", retries, url)
+    return None
+
+
+def _get_raw(url, retries=3, timeout=10):
+    """Comme _get, mais renvoie le texte brut (pour du RSS/XML, pas du JSON)."""
+    for attempt in range(1, retries + 1):
+        try:
+            resp = SESSION.get(url, timeout=timeout)
+            resp.raise_for_status()
+            return resp.text
+        except requests.exceptions.RequestException as exc:
+            log.warning("Échec requête RSS (%s/%s) sur %s : %s", attempt, retries, url, exc)
+            time.sleep(1.5 * attempt)
+    log.error("Abandon après %s tentatives (RSS) : %s", retries, url)
     return None
 
 
@@ -400,6 +441,83 @@ def scan_new_markets():
 
 
 # ---------------------------------------------------------------------------
+# Module 4 — Pilier 2 : workflow d'actualité (RSS, réduire le délai d'info)
+# ---------------------------------------------------------------------------
+
+def load_seen_news():
+    if os.path.exists(SEEN_NEWS_FILE):
+        try:
+            with open(SEEN_NEWS_FILE, "r") as f:
+                return set(json.load(f))
+        except (json.JSONDecodeError, OSError):
+            return set()
+    return set()
+
+
+def save_seen_news(seen):
+    trimmed = list(seen)[-5000:]
+    with open(SEEN_NEWS_FILE, "w") as f:
+        json.dump(trimmed, f)
+
+
+def parse_rss_items(xml_text):
+    """Parse un flux RSS 2.0 basique et renvoie une liste de (titre, lien)."""
+    items = []
+    try:
+        root = ET.fromstring(xml_text)
+    except ET.ParseError:
+        return items
+
+    for item in root.findall(".//item"):
+        title = (item.findtext("title") or "").strip()
+        link = (item.findtext("link") or "").strip()
+        if title:
+            items.append((title, link))
+    return items
+
+
+def scan_news():
+    if not NEWS_ENABLED:
+        return []
+
+    log.info("=== Scan actualité (Général + Moyen-Orient/Iran + Elections US + Europe) ===")
+    seen = load_seen_news()
+    is_first_run = len(seen) == 0
+    alerts = []
+
+    for category, urls in NEWS_FEEDS.items():
+        for url in urls:
+            xml_text = _get_raw(url)
+            if not xml_text:
+                continue
+
+            for title, link in parse_rss_items(xml_text):
+                key = hashlib.md5(f"{title}|{link}".encode("utf-8")).hexdigest()
+                if key in seen:
+                    continue
+                seen.add(key)
+
+                if is_first_run:
+                    continue
+
+                msg = f"[ACTUALITE - {category}] {title}"
+                if link:
+                    msg += f"\n   {link}"
+
+                log.info(msg)
+                alerts.append(msg)
+
+    save_seen_news(seen)
+    if is_first_run:
+        log.info(
+            "Premier passage actualité : %d article(s) enregistrés comme référence, "
+            "pas d'alerte. Les prochains passages n'alerteront que sur les vraies nouveautés.",
+            len(seen),
+        )
+    return alerts
+
+
+# ---------------------------------------------------------------------------
 # Mode screening — export CSV de TOUS les marchés Politique/Géopolitique
 # ---------------------------------------------------------------------------
 
@@ -567,6 +685,7 @@ def run_once(webhook_url=None, ntfy_topic=None):
     all_alerts += scan_mispricing()
     all_alerts += scan_whales()
     all_alerts += scan_new_markets()
+    all_alerts += scan_news()
     if webhook_url:
         send_webhook(webhook_url, all_alerts)
     if ntfy_topic:
