@@ -88,6 +88,18 @@ NEW_MARKETS_SCAN_LIMIT = 100  # nb de marchés les plus récents examinés par t
 NEW_MARKETS_MIN_LIQUIDITY = 0  # filtre optionnel, en USD (0 = pas de filtre)
 SEEN_MARKETS_FILE = os.path.join(os.path.dirname(__file__), "seen_markets.json")
 
+# --- Pilier 3 : vérification structurelle (marge par événement) ---
+# Sur un événement à résultats multiples et mutuellement exclusifs (ex:
+# "Qui sera le prochain PM ?" avec 5 candidats), la somme des prix "Yes"
+# devrait être proche de 100%. L'écart au-dessus (marge) rémunère les
+# teneurs de marché ; une marge anormalement élevée signale un marché peu
+# arbitré (candidat à surveiller). Une marge NÉGATIVE (rarissime) est un
+# arbitrage mathématique réel, peu importe qui gagne.
+MARGIN_ENABLED = True
+MARGIN_SCAN_LIMIT = 100  # nb d'événements les plus actifs examinés par tag, par passage
+MARGIN_HIGH_THRESHOLD = 0.15  # 15% — au-delà, on considère le marché peu efficient
+SEEN_MARGIN_FILE = os.path.join(os.path.dirname(__file__), "seen_margin_alerts.json")
+
 # --- Pilier 2 : workflow d'actualité ---
 # Le vrai edge sur des marchés de niche vient souvent du DÉLAI entre une
 # actualité et sa prise en compte par le prix, pas d'un avis "meilleur".
@@ -518,6 +530,107 @@ def scan_news():
 
 
 # ---------------------------------------------------------------------------
+# Module 5 — Pilier 3 : vérification structurelle (marge par événement)
+# ---------------------------------------------------------------------------
+
+def load_seen_margin_alerts():
+    if os.path.exists(SEEN_MARGIN_FILE):
+        try:
+            with open(SEEN_MARGIN_FILE, "r") as f:
+                return set(json.load(f))
+        except (json.JSONDecodeError, OSError):
+            return set()
+    return set()
+
+
+def save_seen_margin_alerts(seen):
+    trimmed = list(seen)[-5000:]
+    with open(SEEN_MARGIN_FILE, "w") as f:
+        json.dump(trimmed, f)
+
+
+def compute_event_margin(event):
+    """Somme des prix 'Yes' de tous les résultats d'un événement multi-choix.
+    Renvoie None si l'événement n'a pas au moins 3 résultats (pas assez
+    'multi-choix' pour que la marge veuille dire grand-chose) ou si un prix
+    manque. Marge = somme - 100% (ex: 0.05 = 5% au-dessus de 100%)."""
+    markets = event.get("markets", [])
+    if len(markets) < 3:
+        return None
+
+    total = 0.0
+    for market in markets:
+        price = current_price_for_outcome(market, "Yes")
+        if price is None:
+            return None
+        total += price
+
+    return total - 1.0
+
+
+def scan_margin_anomalies():
+    if not MARGIN_ENABLED:
+        return []
+
+    log.info("=== Scan marge structurelle (événements multi-résultats) ===")
+    seen = load_seen_margin_alerts()
+    alerts = []
+
+    for tag_id in NEW_MARKETS_TAG_IDS:
+        data = _get(
+            f"{GAMMA_API}/events",
+            params={
+                "active": "true",
+                "closed": "false",
+                "order": "volume",
+                "ascending": "false",
+                "limit": MARGIN_SCAN_LIMIT,
+                "tag_id": tag_id,
+            },
+        )
+        if not data:
+            continue
+
+        for event in data:
+            margin = compute_event_margin(event)
+            if margin is None:
+                continue
+
+            is_anomaly = margin < 0 or margin >= MARGIN_HIGH_THRESHOLD
+            if not is_anomaly:
+                continue
+
+            event_id = str(event.get("id", ""))
+            if not event_id or event_id in seen:
+                continue
+            seen.add(event_id)
+
+            title = event.get("title") or event.get("ticker") or event_id
+            slug = event.get("slug", "")
+            url = f"https://polymarket.com/event/{slug}" if slug else ""
+            n_outcomes = len(event.get("markets", []))
+
+            if margin < 0:
+                kind = "ARBITRAGE POSSIBLE (marge negative)"
+            else:
+                kind = "Marge anormalement elevee (marche peu arbitre)"
+
+            msg = (
+                f"[MARGE] {kind}\n"
+                f"   {title}\n"
+                f"   Marge : {margin:+.1%} sur {n_outcomes} resultats"
+            )
+            if url:
+                msg += f"\n   {url}"
+
+            log.info(msg)
+            alerts.append(msg)
+
+    save_seen_margin_alerts(seen)
+    return alerts
+
+
+# ---------------------------------------------------------------------------
 # Mode screening — export CSV de TOUS les marchés Politique/Géopolitique
 # ---------------------------------------------------------------------------
 
@@ -686,6 +799,7 @@ def run_once(webhook_url=None, ntfy_topic=None):
     all_alerts += scan_whales()
     all_alerts += scan_new_markets()
     all_alerts += scan_news()
+    all_alerts += scan_margin_anomalies()
     if webhook_url:
         send_webhook(webhook_url, all_alerts)
     if ntfy_topic:
