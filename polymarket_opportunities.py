@@ -484,7 +484,7 @@ def send_ntfy_notification(topic, alerts):
             f"https://ntfy.sh/{topic}",
             data=body.encode("utf-8"),
             headers={
-                "Title": f"Polymarket — {len(alerts)} alerte(s)",
+                "Title": f"Polymarket - {len(alerts)} alerte(s)",
                 "Priority": "default",
                 "Tags": "moneybag",
             },
