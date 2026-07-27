@@ -63,6 +63,12 @@ MIN_EDGE = 0.10
 WHALE_WALLETS = []  # ex: ["0xabc123...", "0xdef456..."]
 LEADERBOARD_TOP_N = 50
 
+# Pilier 1 — copy trading affiné : ne suivre que les traders dont la
+# performance sur les marchés Politique est confirmée récemment (top
+# "tout temps" ET top "dernier mois"), pas juste les plus gros PNL toutes
+# catégories confondues (souvent un seul pari géant gagné une fois).
+WHALE_QUALIFIED_ONLY = True
+
 # Taille minimale (en USD) d'une transaction pour déclencher une alerte whale.
 WHALE_MIN_TRADE_USD = 5000
 
@@ -190,14 +196,51 @@ def scan_mispricing():
 # Module 2 — Whale tracking (smart money)
 # ---------------------------------------------------------------------------
 
-def get_leaderboard(limit=LEADERBOARD_TOP_N):
+def get_leaderboard(limit=LEADERBOARD_TOP_N, category="OVERALL", time_period="ALL"):
     data = _get(
         f"{DATA_API}/v1/leaderboard",
-        params={"limit": min(limit, 50), "timePeriod": "ALL", "orderBy": "PNL"},
+        params={
+            "limit": min(limit, 50),
+            "timePeriod": time_period,
+            "orderBy": "PNL",
+            "category": category,
+        },
     )
     if not data:
         return []
     return [row.get("proxyWallet") for row in data if row.get("proxyWallet")]
+
+
+def get_qualified_traders(limit=LEADERBOARD_TOP_N):
+    """Pilier 1 — copy trading affiné.
+
+    Au lieu de suivre les plus gros PNL toutes catégories confondues (qui
+    peuvent être un seul pari géant gagné une fois), on ne retient que les
+    traders qui apparaissent À LA FOIS dans le top Politique 'tout temps'
+    ET dans le top Politique 'dernier mois' — un signal de performance
+    répétée et récente sur ce créneau précis, pas un coup de chance ancien.
+    """
+    if not WHALE_QUALIFIED_ONLY:
+        return get_leaderboard(limit=limit, category="OVERALL", time_period="ALL")
+
+    all_time = set(get_leaderboard(limit=50, category="POLITICS", time_period="ALL"))
+    last_month = set(get_leaderboard(limit=50, category="POLITICS", time_period="MONTH"))
+    qualified = list(all_time & last_month)
+
+    log.info(
+        "Traders qualifiés (top Politique tout-temps ET dernier mois) : %d",
+        len(qualified),
+    )
+
+    if len(qualified) < 5:
+        log.warning(
+            "Peu de traders qualifiés (%d) — complément avec le top Politique "
+            "'tout temps' pour avoir une base suffisante.",
+            len(qualified),
+        )
+        qualified = list(set(qualified) | all_time)
+
+    return qualified[:limit]
 
 
 def get_recent_activity(wallet, limit=20):
@@ -223,7 +266,7 @@ def save_seen_trades(seen):
 
 
 def scan_whales():
-    wallets = WHALE_WALLETS or get_leaderboard()
+    wallets = WHALE_WALLETS or get_qualified_traders()
     log.info("=== Scan whale tracking (%d wallet(s)) ===", len(wallets))
 
     seen = load_seen_trades()
@@ -257,7 +300,7 @@ def scan_whales():
 
 
 # ---------------------------------------------------------------------------
-# Module 3 — Nouveaux marchés (filtré Politique / Géopolitique)
+# Module 3 — Nouveaux marchés (tous secteurs, alerte simple)
 # ---------------------------------------------------------------------------
 
 def load_seen_markets():
@@ -461,7 +504,7 @@ def run_screening(output_path=None):
 
 
 # ---------------------------------------------------------------------------
-# Notifications (webhook Discord/Slack + notification téléphone ntfy.sh)
+# Notifications (optionnel — webhook Discord/Slack)
 # ---------------------------------------------------------------------------
 
 def send_webhook(webhook_url, alerts):
